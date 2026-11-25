@@ -25,7 +25,7 @@ TARGETS = [
         "required_emails": [],
         "required_texts": ["13587447654"],
         "check_qr": True,
-        "interact_for_wechat": True  # 开启自动点击弹窗/购物车流程以检测微信号和二维码
+        "interact_for_wechat": True
     }
 ]
 
@@ -67,11 +67,10 @@ def hash_image_source(src: str) -> str:
 
 
 def extract_qr_hashes(page, base_url, extra_text):
-    """从当前页面 DOM 和已抓取的文本中提取二维码图片哈希"""
+    """提取当前页面中渲染出的二维码图片哈希（兼容 Base64 内嵌图与图片链接）"""
     qr_hashes = {}
     candidate_urls = set()
 
-    # 1) 扫描当前页面所有 <img> 标签（包含 Base64 内嵌图）
     try:
         imgs = page.eval_on_selector_all(
             "img",
@@ -89,7 +88,6 @@ def extract_qr_hashes(page, base_url, extra_text):
         if not src:
             continue
         if src.startswith("data:image"):
-            # 过滤掉极小的图标，保留二维码等 Base64 大图
             if len(src) >= 1500:
                 candidate_urls.add(src)
         else:
@@ -98,7 +96,6 @@ def extract_qr_hashes(page, base_url, extra_text):
             if any(k in meta for k in QR_KEYWORDS):
                 candidate_urls.add(full_src)
 
-    # 2) 从 HTML / JS / JSON 文本中扫描 Base64 内嵌图
     b64_matches = re.findall(
         r'data:image/(?:png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]{1500,}',
         extra_text,
@@ -106,16 +103,6 @@ def extract_qr_hashes(page, base_url, extra_text):
     )
     for b64_img in set(b64_matches):
         candidate_urls.add(b64_img)
-
-    # 3) 从 JS / JSON 文本中扫描二维码链接
-    js_img_matches = re.findall(
-        r'["\']((?:https?://|/|assets/)[^"\'\s]{1,200}\.(?:png|jpe?g|webp|gif))["\']',
-        extra_text,
-        flags=re.IGNORECASE
-    )
-    for match in js_img_matches:
-        if any(k in match.lower() for k in QR_KEYWORDS):
-            candidate_urls.add(urljoin(base_url, match))
 
     for qurl in sorted(candidate_urls):
         try:
@@ -129,43 +116,91 @@ def extract_qr_hashes(page, base_url, extra_text):
     return qr_hashes
 
 
+def list_visible_buttons(page, limit=25):
+    texts = []
+    try:
+        raw = page.eval_on_selector_all(
+            "button, a, [role='button']",
+            """els => els
+                .filter(el => el.offsetParent !== null)
+                .map(el => (el.innerText || '').replace(/\\s+/g, ' ').trim())
+                .filter(t => t.length > 0 && t.length <= 35)"""
+        )
+        for t in raw:
+            if t not in texts:
+                texts.append(t)
+            if len(texts) >= limit:
+                break
+    except Exception:
+        pass
+    return texts
+
+
 def try_click_by_text(page, patterns):
+    """按优先级依次尝试点击可见的按钮或文本元素"""
     for pat in patterns:
-        try:
-            loc = page.locator(f"text=/{pat}/i").first
-            if loc.count() > 0 and loc.is_visible():
-                loc.click(timeout=3000)
-                return pat
-        except Exception:
-            continue
+        for group in (
+            page.locator("button, a, [role='button']").filter(has_text=pat),
+            page.get_by_text(pat),
+        ):
+            try:
+                count = min(group.count(), 5)
+                for idx in range(count):
+                    el = group.nth(idx)
+                    if el.is_visible():
+                        el.click(timeout=3000)
+                        return pat
+            except Exception:
+                continue
     return None
 
 
-def fill_visible_inputs(page):
-    """给结算表单里的可见输入框填入测试信息，以便进入微信付款步骤"""
+def fill_shipping_form(page):
+    """自动填写「确认收货信息」表单里的可见输入框和下拉框"""
     inputs = page.locator("input:visible, textarea:visible")
     count = inputs.count()
+    filled = 0
     for i in range(count):
         try:
             el = inputs.nth(i)
+            if not el.is_editable():
+                continue
             itype = (el.get_attribute("type") or "text").lower()
             if itype in ("hidden", "checkbox", "radio", "submit", "button", "file", "search"):
                 continue
             hint = f"{el.get_attribute('placeholder') or ''} {el.get_attribute('name') or ''} {el.get_attribute('id') or ''}".lower()
+            # 跳过顶部搜索框
+            if any(k in hint for k in ("search", "搜索", "查找")):
+                continue
             if any(k in hint for k in ("phone", "tel", "mobile", "手机", "电话", "联系")):
                 el.fill("13800138000")
             elif any(k in hint for k in ("mail", "邮箱")):
                 el.fill("test@example.com")
-            elif any(k in hint for k in ("addr", "地址")):
+            elif any(k in hint for k in ("addr", "地址", "省", "市", "区", "街道")):
                 el.fill("广东省广州市天河区测试路1号")
+            elif any(k in hint for k in ("remark", "note", "备注", "刻字")):
+                el.fill("测试")
             else:
                 el.fill("测试用户")
+            filled += 1
         except Exception:
             continue
 
+    # 若表单包含省市区下拉框，默认选择第一个有效选项
+    selects = page.locator("select:visible")
+    for i in range(selects.count()):
+        try:
+            sel = selects.nth(i)
+            if sel.locator("option").count() > 1:
+                sel.select_option(index=1)
+        except Exception:
+            continue
+
+    return filled
+
 
 def interact_to_reveal_wechat(page, base_url, extra_chunks, required_texts):
-    """尝试点开右下角官方微信顾问或走一遍购物车第二步，触发微信号和二维码渲染"""
+    """按固定流程：加购商品 -> 点购物车 -> 点立即结算 -> 确认收货信息进入第二步"""
     def check_now():
         body_txt = page.inner_text("body")
         html_txt = page.content()
@@ -174,43 +209,69 @@ def interact_to_reveal_wechat(page, base_url, extra_chunks, required_texts):
         qrs = extract_qr_hashes(page, base_url, combined)
         return missing, qrs
 
-    # 途径 1：尝试点击右下角「专属品鉴顾问 / 企业微信官方直连」
-    clicked = try_click_by_text(page, ["专属品鉴顾问", "企业微信官方直连", "官方微信", "联系顾问"])
-    if clicked:
-        print(f"[交互探针] 已点击右下角入口: {clicked}")
-        page.wait_for_timeout(2000)
-        missing, qrs = check_now()
-        if not missing and qrs:
-            return missing, qrs
-
-    # 途径 2：走购物车 -> 确认收货信息 -> 添加官方微信完成付款
-    try_click_by_text(page, ["加入购物车", "加入清单", "立即购买", "立即选购"])
-    page.wait_for_timeout(1200)
-
-    # 如果首页没有直接的加购按钮，尝试先点开第一个商品再加购
-    if not try_click_by_text(page, ["购物车"]):
-        try:
-            page.locator("img").nth(1).click(timeout=2000)
-            page.wait_for_timeout(1200)
-        except Exception:
-            pass
-        try_click_by_text(page, ["加入购物车", "加入清单", "立即购买"])
-        page.wait_for_timeout(1200)
-        try_click_by_text(page, ["购物车"])
-
+    # 1. 先向购物车加入 1 件商品（新浏览器会话默认购物车为空）
+    page.mouse.wheel(0, 700)
     page.wait_for_timeout(1500)
-    try_click_by_text(page, ["去结算", "立即结算", "确认下单", "下一步"])
+    add_btn = try_click_by_text(page, ["加入购物车", "加入购物袋", "加入清单", "加购", "立即购买", "立即选购"])
+    if not add_btn:
+        # 首页卡片没有直接加购按钮时，点开带“¥”价格的第一个商品卡片再加购
+        try:
+            price_el = page.get_by_text("¥").first
+            if price_el.count() > 0 and price_el.is_visible():
+                price_el.click(timeout=3000)
+                print("[购物流程] 步骤1a: 已点击商品卡片进入详情")
+                page.wait_for_timeout(1500)
+                add_btn = try_click_by_text(page, ["加入购物车", "加入购物袋", "加入清单", "立即购买", "立即选购", "确认加入"])
+        except Exception as e:
+            print(f"[购物流程] 步骤1a 点击商品卡片异常: {e}")
+
+    print(f"[购物流程] 步骤1 加购结果: {add_btn}")
     page.wait_for_timeout(1200)
 
-    # 填写收货信息并进入第二步
-    fill_visible_inputs(page)
+    # 2. 点击右上角「购物车」
+    cart_btn = try_click_by_text(page, ["购物车"])
+    print(f"[购物流程] 步骤2 打开购物车: {cart_btn}")
+    page.wait_for_timeout(1500)
+
+    # 3. 点击「立即结算 / 添加官方微信付款」
+    print(f"[购物流程] 购物车可见按钮: {list_visible_buttons(page)}")
+    checkout_btn = try_click_by_text(
+        page,
+        ["立即结算", "添加官方微信付款", "添加官方微信完成付款", "去结算", "立即下单", "结算"]
+    )
+    print(f"[购物流程] 步骤3 点击结算: {checkout_btn}")
+    page.wait_for_timeout(1500)
+
+    # 4. 填写收货信息并点击「确认收货信息」进入第二步
+    filled = fill_shipping_form(page)
+    print(f"[购物流程] 步骤4a 已填写 {filled} 个收货信息字段，当前可见按钮: {list_visible_buttons(page)}")
     page.wait_for_timeout(500)
-    step2_btn = try_click_by_text(page, ["下一步", "添加官方微信", "前往付款", "提交订单", "确认收货信息", "确认并继续"])
-    if step2_btn:
-        print(f"[交互探针] 已点击进入结算第二步: {step2_btn}")
+
+    step2_btn = try_click_by_text(
+        page,
+        [
+            "确认收货信息",
+            "添加官方微信完成付款",
+            "添加官方微信付款",
+            "进入第二步",
+            "下一步",
+            "提交订单",
+            "锁定订单",
+            "确认并继续",
+            "去付款"
+        ]
+    )
+    print(f"[购物流程] 步骤4b 进入第二步点击结果: {step2_btn}")
     page.wait_for_timeout(2500)
 
-    return check_now()
+    # 5. 检查是否已经拿到微信号和二维码
+    missing, qrs = check_now()
+    if missing or not qrs:
+        print(f"[购物流程] 未完全识别，当前可见按钮: {list_visible_buttons(page)}")
+        tail_lines = [l.strip() for l in page.inner_text("body").splitlines() if l.strip()][-15:]
+        print(f"[购物流程] 页面末尾文字: {tail_lines}")
+
+    return missing, qrs
 
 
 def fetch_site_data(browser, target):
@@ -234,8 +295,7 @@ def fetch_site_data(browser, target):
                 if any(skip in rurl for skip in ("google-analytics", "googletagmanager", "hm.baidu.com", "clarity.ms")):
                     return
                 ctype = resp.headers.get("content-type", "").lower()
-                path_no_query = rurl.split("?")[0]
-                if "javascript" in ctype or "json" in ctype or path_no_query.endswith(".js"):
+                if "javascript" in ctype or "json" in ctype or rurl.split("?")[0].endswith(".js"):
                     extra_chunks.append(resp.text())
             except Exception:
                 pass
@@ -251,7 +311,7 @@ def fetch_site_data(browser, target):
 
             page.wait_for_timeout(4500)
 
-            # 1) 先提取干净的首页正文和价格（用于变动对比，不受后续点击弹窗干扰）
+            # 先记录干净的首页正文和价格（不受后续购物车操作影响）
             visible_text = page.inner_text("body")
             raw_html = page.content()
             lines = [line.strip() for line in visible_text.splitlines() if line.strip()]
@@ -265,19 +325,15 @@ def fetch_site_data(browser, target):
                 )
             ))
 
-            # 2) 在首页 + 已捕获的所有 JS/JSON 中初步校验关键文字和二维码
             searchable_source = f"{normalized_text}\n{raw_html}\n" + "\n".join(extra_chunks)
             req_texts = target.get("required_texts", [])
             missing_texts = [req for req in req_texts if req not in searchable_source]
             qr_hashes = extract_qr_hashes(page, url, searchable_source) if target.get("check_qr") else {}
 
-            print(f"[{name}] 首页加载捕获 {len(extra_chunks)} 个 JS/JSON 资源，初步识别二维码 {len(qr_hashes)} 张，缺失关键词: {missing_texts}")
-
-            # 3) 若开启了交互探针，且关键文字或二维码尚未全部找到，则自动点击进入微信付款步骤再抓一次
             if target.get("interact_for_wechat") and (missing_texts or (target.get("check_qr") and not qr_hashes)):
-                print(f"[{name}] 启动自动点击探针，尝试打开微信付款/顾问弹窗...")
+                print(f"[{name}] 启动购物车结算流程检测微信号与二维码...")
                 missing_texts, qr_hashes = interact_to_reveal_wechat(page, url, extra_chunks, req_texts)
-                print(f"[{name}] 交互后识别二维码 {len(qr_hashes)} 张，缺失关键词: {missing_texts}")
+                print(f"[{name}] 流程完成：识别二维码 {len(qr_hashes)} 张，缺失关键词: {missing_texts}")
 
             context.close()
             return {
@@ -355,7 +411,6 @@ def main():
 
             site_issues = []
 
-            # 1. 校验邮箱
             req_emails = [e.lower() for e in target.get("required_emails", [])]
             if req_emails:
                 for req_email in req_emails:
@@ -365,11 +420,9 @@ def main():
                 if extra_emails:
                     site_issues.append(f"发现异常/新增邮箱：`{extra_emails}`")
 
-            # 2. 校验指定文字（如企业微信号）
             for missing in current["missing_texts"]:
                 site_issues.append(f"关键信息 `{missing}` **已消失或被篡改**！")
 
-            # 3. 历史状态对比
             if url not in saved_state:
                 saved_state[url] = {
                     "text_hash": current["text_hash"],
