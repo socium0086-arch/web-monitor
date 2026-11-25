@@ -4,7 +4,7 @@ import json
 import os
 import re
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -17,8 +17,7 @@ TARGETS = [
         "required_emails": ["manager@kobrox.net"],
         "required_texts": [],
         "check_qr": False,
-        "qr_selector": "",
-        "qr_urls": []
+        "interact_for_wechat": False
     },
     {
         "name": "FAVILLA 官网",
@@ -26,8 +25,7 @@ TARGETS = [
         "required_emails": [],
         "required_texts": ["13587447654"],
         "check_qr": True,
-        "qr_selector": "",
-        "qr_urls": []
+        "interact_for_wechat": True  # 开启自动点击弹窗/购物车流程以检测微信号和二维码
     }
 ]
 
@@ -58,7 +56,6 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def hash_image_source(src: str) -> str:
-    """计算图片哈希（同时兼容 Base64 内嵌图和普通图片链接）"""
     if src.startswith("data:image"):
         return sha256_bytes(src.encode("utf-8"))
     headers = {
@@ -69,20 +66,162 @@ def hash_image_source(src: str) -> str:
     return sha256_bytes(resp.content)
 
 
-def get_root_domain(host: str) -> str:
-    parts = host.lower().split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
+def extract_qr_hashes(page, base_url, extra_text):
+    """从当前页面 DOM 和已抓取的文本中提取二维码图片哈希"""
+    qr_hashes = {}
+    candidate_urls = set()
+
+    # 1) 扫描当前页面所有 <img> 标签（包含 Base64 内嵌图）
+    try:
+        imgs = page.eval_on_selector_all(
+            "img",
+            """els => els.map(el => ({
+                src: el.getAttribute('src') || '',
+                alt: el.getAttribute('alt') || '',
+                cls: el.getAttribute('class') || ''
+            }))"""
+        )
+    except Exception:
+        imgs = []
+
+    for img in imgs:
+        src = img["src"].strip()
+        if not src:
+            continue
+        if src.startswith("data:image"):
+            # 过滤掉极小的图标，保留二维码等 Base64 大图
+            if len(src) >= 1500:
+                candidate_urls.add(src)
+        else:
+            full_src = urljoin(base_url, src)
+            meta = f"{full_src} {img['alt']} {img['cls']}".lower()
+            if any(k in meta for k in QR_KEYWORDS):
+                candidate_urls.add(full_src)
+
+    # 2) 从 HTML / JS / JSON 文本中扫描 Base64 内嵌图
+    b64_matches = re.findall(
+        r'data:image/(?:png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]{1500,}',
+        extra_text,
+        flags=re.IGNORECASE
+    )
+    for b64_img in set(b64_matches):
+        candidate_urls.add(b64_img)
+
+    # 3) 从 JS / JSON 文本中扫描二维码链接
+    js_img_matches = re.findall(
+        r'["\']((?:https?://|/|assets/)[^"\'\s]{1,200}\.(?:png|jpe?g|webp|gif))["\']',
+        extra_text,
+        flags=re.IGNORECASE
+    )
+    for match in js_img_matches:
+        if any(k in match.lower() for k in QR_KEYWORDS):
+            candidate_urls.add(urljoin(base_url, match))
+
+    for qurl in sorted(candidate_urls):
+        try:
+            img_hash = hash_image_source(qurl)
+            key = f"base64:{img_hash[:16]}" if qurl.startswith("data:image") else qurl
+            qr_hashes[key] = img_hash
+        except Exception as img_err:
+            key = "base64:error" if qurl.startswith("data:image") else qurl
+            qr_hashes[key] = f"DOWNLOAD_ERROR:{img_err}"
+
+    return qr_hashes
+
+
+def try_click_by_text(page, patterns):
+    for pat in patterns:
+        try:
+            loc = page.locator(f"text=/{pat}/i").first
+            if loc.count() > 0 and loc.is_visible():
+                loc.click(timeout=3000)
+                return pat
+        except Exception:
+            continue
+    return None
+
+
+def fill_visible_inputs(page):
+    """给结算表单里的可见输入框填入测试信息，以便进入微信付款步骤"""
+    inputs = page.locator("input:visible, textarea:visible")
+    count = inputs.count()
+    for i in range(count):
+        try:
+            el = inputs.nth(i)
+            itype = (el.get_attribute("type") or "text").lower()
+            if itype in ("hidden", "checkbox", "radio", "submit", "button", "file", "search"):
+                continue
+            hint = f"{el.get_attribute('placeholder') or ''} {el.get_attribute('name') or ''} {el.get_attribute('id') or ''}".lower()
+            if any(k in hint for k in ("phone", "tel", "mobile", "手机", "电话", "联系")):
+                el.fill("13800138000")
+            elif any(k in hint for k in ("mail", "邮箱")):
+                el.fill("test@example.com")
+            elif any(k in hint for k in ("addr", "地址")):
+                el.fill("广东省广州市天河区测试路1号")
+            else:
+                el.fill("测试用户")
+        except Exception:
+            continue
+
+
+def interact_to_reveal_wechat(page, base_url, extra_chunks, required_texts):
+    """尝试点开右下角官方微信顾问或走一遍购物车第二步，触发微信号和二维码渲染"""
+    def check_now():
+        body_txt = page.inner_text("body")
+        html_txt = page.content()
+        combined = f"{body_txt}\n{html_txt}\n" + "\n".join(extra_chunks)
+        missing = [t for t in required_texts if t not in combined]
+        qrs = extract_qr_hashes(page, base_url, combined)
+        return missing, qrs
+
+    # 途径 1：尝试点击右下角「专属品鉴顾问 / 企业微信官方直连」
+    clicked = try_click_by_text(page, ["专属品鉴顾问", "企业微信官方直连", "官方微信", "联系顾问"])
+    if clicked:
+        print(f"[交互探针] 已点击右下角入口: {clicked}")
+        page.wait_for_timeout(2000)
+        missing, qrs = check_now()
+        if not missing and qrs:
+            return missing, qrs
+
+    # 途径 2：走购物车 -> 确认收货信息 -> 添加官方微信完成付款
+    try_click_by_text(page, ["加入购物车", "加入清单", "立即购买", "立即选购"])
+    page.wait_for_timeout(1200)
+
+    # 如果首页没有直接的加购按钮，尝试先点开第一个商品再加购
+    if not try_click_by_text(page, ["购物车"]):
+        try:
+            page.locator("img").nth(1).click(timeout=2000)
+            page.wait_for_timeout(1200)
+        except Exception:
+            pass
+        try_click_by_text(page, ["加入购物车", "加入清单", "立即购买"])
+        page.wait_for_timeout(1200)
+        try_click_by_text(page, ["购物车"])
+
+    page.wait_for_timeout(1500)
+    try_click_by_text(page, ["去结算", "立即结算", "确认下单", "下一步"])
+    page.wait_for_timeout(1200)
+
+    # 填写收货信息并进入第二步
+    fill_visible_inputs(page)
+    page.wait_for_timeout(500)
+    step2_btn = try_click_by_text(page, ["下一步", "添加官方微信", "前往付款", "提交订单", "确认收货信息", "确认并继续"])
+    if step2_btn:
+        print(f"[交互探针] 已点击进入结算第二步: {step2_btn}")
+    page.wait_for_timeout(2500)
+
+    return check_now()
 
 
 def fetch_site_data(browser, target):
-    """访问网页，同时捕获正文、HTML、前端 JS 及同域 JSON 接口数据"""
     url = target["url"]
-    root_domain = get_root_domain(urlparse(url).netloc)
+    name = target["name"]
     last_err = None
 
     for attempt in range(2):
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1440, "height": 900}
         )
         page = context.new_page()
         extra_chunks = []
@@ -91,16 +230,12 @@ def fetch_site_data(browser, target):
             try:
                 if resp.status != 200:
                     return
-                resp_host = urlparse(resp.url).netloc.lower()
-                if not resp_host.endswith(root_domain):
+                rurl = resp.url.lower()
+                if any(skip in rurl for skip in ("google-analytics", "googletagmanager", "hm.baidu.com", "clarity.ms")):
                     return
                 ctype = resp.headers.get("content-type", "").lower()
-                path_no_query = resp.url.split("?")[0].lower()
-                if (
-                    "javascript" in ctype
-                    or "json" in ctype
-                    or path_no_query.endswith(".js")
-                ):
+                path_no_query = rurl.split("?")[0]
+                if "javascript" in ctype or "json" in ctype or path_no_query.endswith(".js"):
                     extra_chunks.append(resp.text())
             except Exception:
                 pass
@@ -114,17 +249,15 @@ def fetch_site_data(browser, target):
             if response.status >= 400:
                 raise RuntimeError(f"HTTP 状态码异常: {response.status}")
 
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(4500)
 
+            # 1) 先提取干净的首页正文和价格（用于变动对比，不受后续点击弹窗干扰）
             visible_text = page.inner_text("body")
             raw_html = page.content()
-            extra_text = "\n".join(extra_chunks)
-
             lines = [line.strip() for line in visible_text.splitlines() if line.strip()]
             normalized_text = "\n".join(lines)
             text_hash = sha256_bytes(normalized_text.encode("utf-8"))
 
-            # 仅从正文和 HTML 提取邮箱，避免 JS 注释引发误报
             emails = sorted(set(
                 e.lower() for e in re.findall(
                     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
@@ -132,76 +265,19 @@ def fetch_site_data(browser, target):
                 )
             ))
 
-            # 在正文、HTML、JS 及 JSON 接口中校验关键信息（如企业微信号）
-            searchable_source = f"{normalized_text}\n{raw_html}\n{extra_text}"
-            missing_texts = [
-                req for req in target.get("required_texts", [])
-                if req not in searchable_source
-            ]
+            # 2) 在首页 + 已捕获的所有 JS/JSON 中初步校验关键文字和二维码
+            searchable_source = f"{normalized_text}\n{raw_html}\n" + "\n".join(extra_chunks)
+            req_texts = target.get("required_texts", [])
+            missing_texts = [req for req in req_texts if req not in searchable_source]
+            qr_hashes = extract_qr_hashes(page, url, searchable_source) if target.get("check_qr") else {}
 
-            # 收集并校验二维码图片（同时支持普通 URL 和 Base64 内嵌图）
-            qr_hashes = {}
-            if target.get("check_qr"):
-                candidate_urls = set()
+            print(f"[{name}] 首页加载捕获 {len(extra_chunks)} 个 JS/JSON 资源，初步识别二维码 {len(qr_hashes)} 张，缺失关键词: {missing_texts}")
 
-                # 1) 手动指定的图片直链
-                for manual_url in target.get("qr_urls", []):
-                    if manual_url.strip():
-                        candidate_urls.add(manual_url.strip())
-
-                # 2) 当前页面 <img> 标签
-                selector = target.get("qr_selector") or "img"
-                imgs = page.eval_on_selector_all(
-                    selector,
-                    """els => els.map(el => ({
-                        src: el.getAttribute('src') || '',
-                        alt: el.getAttribute('alt') || '',
-                        cls: el.getAttribute('class') || ''
-                    }))"""
-                )
-                for img in imgs:
-                    src = img["src"].strip()
-                    if not src:
-                        continue
-                    full_src = src if src.startswith("data:image") else urljoin(url, src)
-                    if not target.get("qr_selector"):
-                        if full_src.startswith("data:image"):
-                            if len(full_src) < 1500:
-                                continue
-                        else:
-                            meta = f"{full_src} {img['alt']} {img['cls']}".lower()
-                            if not any(k in meta for k in QR_KEYWORDS):
-                                continue
-                    candidate_urls.add(full_src)
-
-                # 3) 从前端 JS / 接口中扫描二维码图片路径
-                js_img_matches = re.findall(
-                    r'["\']((?:https?://|/|assets/)[^"\'\s]{1,200}\.(?:png|jpe?g|webp|gif))["\']',
-                    extra_text,
-                    flags=re.IGNORECASE
-                )
-                for match in js_img_matches:
-                    if any(k in match.lower() for k in QR_KEYWORDS):
-                        candidate_urls.add(urljoin(url, match))
-
-                # 4) 从 HTML / JS / 接口中扫描 Base64 内嵌大图（过滤掉小图标，锁定二维码等内嵌图）
-                b64_matches = re.findall(
-                    r'data:image/(?:png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]{1500,}',
-                    searchable_source,
-                    flags=re.IGNORECASE
-                )
-                for b64_img in set(b64_matches):
-                    img_hash = sha256_bytes(b64_img.encode("utf-8"))
-                    qr_hashes[f"base64:{img_hash[:16]}"] = img_hash
-
-                for qurl in sorted(candidate_urls):
-                    try:
-                        img_hash = hash_image_source(qurl)
-                        key = f"base64:{img_hash[:16]}" if qurl.startswith("data:image") else qurl
-                        qr_hashes[key] = img_hash
-                    except Exception as img_err:
-                        key = "base64:error" if qurl.startswith("data:image") else qurl
-                        qr_hashes[key] = f"DOWNLOAD_ERROR:{img_err}"
+            # 3) 若开启了交互探针，且关键文字或二维码尚未全部找到，则自动点击进入微信付款步骤再抓一次
+            if target.get("interact_for_wechat") and (missing_texts or (target.get("check_qr") and not qr_hashes)):
+                print(f"[{name}] 启动自动点击探针，尝试打开微信付款/顾问弹窗...")
+                missing_texts, qr_hashes = interact_to_reveal_wechat(page, url, extra_chunks, req_texts)
+                print(f"[{name}] 交互后识别二维码 {len(qr_hashes)} 张，缺失关键词: {missing_texts}")
 
             context.close()
             return {
