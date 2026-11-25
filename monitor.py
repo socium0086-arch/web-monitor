@@ -4,7 +4,7 @@ import json
 import os
 import re
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -14,25 +14,26 @@ TARGETS = [
     {
         "name": "KOBROX 官网",
         "url": "https://www.kobrox.net",
-        "required_emails": ["manager@kobrox.net"],  # 必须存在的邮箱，若丢失或出现其他未知邮箱立即告警
-        "required_texts": [],                       # 必须存在的关键文字
-        "check_qr": False,                          # 是否监控二维码图片
-        "qr_selector": ""                           # 可选：二维码精准 CSS 选择器
+        "required_emails": ["manager@kobrox.net"],
+        "required_texts": [],
+        "check_qr": False,
+        "qr_selector": "",
+        "qr_urls": []
     },
     {
         "name": "FAVILLA 官网",
         "url": "https://www.favillacigar.com",
         "required_emails": [],
-        "required_texts": ["13587447654"],          # 必须存在的企业微信号
-        "check_qr": True,                           # 开启二维码图片监控（校验图片地址+文件哈希）
-        "qr_selector": ""                           # 留空自动识别含 qr/wechat/wx 等关键词的图片；也可填精准选择器
+        "required_texts": ["13587447654"],
+        "check_qr": True,
+        "qr_selector": "",
+        "qr_urls": []
     }
-    # 如果产品价格在子页面（例如 /products），可按上面格式再复制一段加在这里
 ]
 
 STATE_FILE = "last_state.json"
 DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK")
-QR_KEYWORDS = ("qr", "wechat", "weixin", "wx", "code", "码")
+QR_KEYWORDS = ("qr", "wechat", "weixin", "wx", "code", "kefu", "kf", "pay", "码")
 # ==========================================
 
 
@@ -57,7 +58,7 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def hash_image_source(src: str) -> str:
-    """下载图片并计算二进制哈希，防止只替换图片内容但文件名不变的情况"""
+    """计算图片哈希（同时兼容 Base64 内嵌图和普通图片链接）"""
     if src.startswith("data:image"):
         return sha256_bytes(src.encode("utf-8"))
     headers = {
@@ -68,9 +69,15 @@ def hash_image_source(src: str) -> str:
     return sha256_bytes(resp.content)
 
 
+def get_root_domain(host: str) -> str:
+    parts = host.lower().split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
+
+
 def fetch_site_data(browser, target):
-    """使用无头浏览器访问网页，带 1 次失败重试，避免偶发网络波动误报"""
+    """访问网页，同时捕获正文、HTML、前端 JS 及同域 JSON 接口数据"""
     url = target["url"]
+    root_domain = get_root_domain(urlparse(url).netloc)
     last_err = None
 
     for attempt in range(2):
@@ -78,6 +85,28 @@ def fetch_site_data(browser, target):
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
         page = context.new_page()
+        extra_chunks = []
+
+        def handle_response(resp):
+            try:
+                if resp.status != 200:
+                    return
+                resp_host = urlparse(resp.url).netloc.lower()
+                if not resp_host.endswith(root_domain):
+                    return
+                ctype = resp.headers.get("content-type", "").lower()
+                path_no_query = resp.url.split("?")[0].lower()
+                if (
+                    "javascript" in ctype
+                    or "json" in ctype
+                    or path_no_query.endswith(".js")
+                ):
+                    extra_chunks.append(resp.text())
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+
         try:
             response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
             if response is None:
@@ -85,18 +114,17 @@ def fetch_site_data(browser, target):
             if response.status >= 400:
                 raise RuntimeError(f"HTTP 状态码异常: {response.status}")
 
-            # 等待前端脚本、价格、图片渲染完成
             page.wait_for_timeout(4000)
 
             visible_text = page.inner_text("body")
             raw_html = page.content()
+            extra_text = "\n".join(extra_chunks)
 
-            # 清理空行，提取用于对比的正文行
             lines = [line.strip() for line in visible_text.splitlines() if line.strip()]
             normalized_text = "\n".join(lines)
             text_hash = sha256_bytes(normalized_text.encode("utf-8"))
 
-            # 提取页面中的所有邮箱（正文 + HTML 中的 mailto）
+            # 仅从正文和 HTML 提取邮箱，避免 JS 注释引发误报
             emails = sorted(set(
                 e.lower() for e in re.findall(
                     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
@@ -104,9 +132,24 @@ def fetch_site_data(browser, target):
                 )
             ))
 
-            # 提取二维码图片信息
+            # 在正文、HTML、JS 及 JSON 接口中校验关键信息（如企业微信号）
+            searchable_source = f"{normalized_text}\n{raw_html}\n{extra_text}"
+            missing_texts = [
+                req for req in target.get("required_texts", [])
+                if req not in searchable_source
+            ]
+
+            # 收集并校验二维码图片（同时支持普通 URL 和 Base64 内嵌图）
             qr_hashes = {}
             if target.get("check_qr"):
+                candidate_urls = set()
+
+                # 1) 手动指定的图片直链
+                for manual_url in target.get("qr_urls", []):
+                    if manual_url.strip():
+                        candidate_urls.add(manual_url.strip())
+
+                # 2) 当前页面 <img> 标签
                 selector = target.get("qr_selector") or "img"
                 imgs = page.eval_on_selector_all(
                     selector,
@@ -121,23 +164,51 @@ def fetch_site_data(browser, target):
                     if not src:
                         continue
                     full_src = src if src.startswith("data:image") else urljoin(url, src)
-
-                    # 如果未指定选择器，则按关键词筛选二维码图片
                     if not target.get("qr_selector"):
-                        meta = f"{full_src} {img['alt']} {img['cls']}".lower()
-                        if not any(k in meta for k in QR_KEYWORDS):
-                            continue
+                        if full_src.startswith("data:image"):
+                            if len(full_src) < 1500:
+                                continue
+                        else:
+                            meta = f"{full_src} {img['alt']} {img['cls']}".lower()
+                            if not any(k in meta for k in QR_KEYWORDS):
+                                continue
+                    candidate_urls.add(full_src)
 
+                # 3) 从前端 JS / 接口中扫描二维码图片路径
+                js_img_matches = re.findall(
+                    r'["\']((?:https?://|/|assets/)[^"\'\s]{1,200}\.(?:png|jpe?g|webp|gif))["\']',
+                    extra_text,
+                    flags=re.IGNORECASE
+                )
+                for match in js_img_matches:
+                    if any(k in match.lower() for k in QR_KEYWORDS):
+                        candidate_urls.add(urljoin(url, match))
+
+                # 4) 从 HTML / JS / 接口中扫描 Base64 内嵌大图（过滤掉小图标，锁定二维码等内嵌图）
+                b64_matches = re.findall(
+                    r'data:image/(?:png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]{1500,}',
+                    searchable_source,
+                    flags=re.IGNORECASE
+                )
+                for b64_img in set(b64_matches):
+                    img_hash = sha256_bytes(b64_img.encode("utf-8"))
+                    qr_hashes[f"base64:{img_hash[:16]}"] = img_hash
+
+                for qurl in sorted(candidate_urls):
                     try:
-                        qr_hashes[full_src] = hash_image_source(full_src)
+                        img_hash = hash_image_source(qurl)
+                        key = f"base64:{img_hash[:16]}" if qurl.startswith("data:image") else qurl
+                        qr_hashes[key] = img_hash
                     except Exception as img_err:
-                        qr_hashes[full_src] = f"DOWNLOAD_ERROR:{img_err}"
+                        key = "base64:error" if qurl.startswith("data:image") else qurl
+                        qr_hashes[key] = f"DOWNLOAD_ERROR:{img_err}"
 
             context.close()
             return {
                 "text_hash": text_hash,
                 "lines": lines,
                 "emails": emails,
+                "missing_texts": missing_texts,
                 "qr_hashes": qr_hashes
             }
         except Exception as e:
@@ -150,7 +221,6 @@ def fetch_site_data(browser, target):
 
 
 def get_text_diff(old_lines, new_lines, max_lines=12):
-    """生成精简的文本变动对比，方便在钉钉里直接看改了什么"""
     diff = list(difflib.unified_diff(old_lines, new_lines, lineterm="", n=0))
     changes = [
         line for line in diff
@@ -184,9 +254,9 @@ def save_state(state):
 
 def main():
     saved_state = load_state()
-    critical_alerts = []  # 宕机、邮箱/微信号/二维码异常
-    change_alerts = []    # 信息、价格变动
-    init_reports = []     # 首次初始化报告
+    critical_alerts = []
+    change_alerts = []
+    init_reports = []
     state_updated = False
 
     with sync_playwright() as p:
@@ -207,10 +277,9 @@ def main():
                 )
                 continue
 
-            # ---------- 1. 关键防篡改规则实时校验 ----------
             site_issues = []
 
-            # 校验邮箱
+            # 1. 校验邮箱
             req_emails = [e.lower() for e in target.get("required_emails", [])]
             if req_emails:
                 for req_email in req_emails:
@@ -220,17 +289,24 @@ def main():
                 if extra_emails:
                     site_issues.append(f"发现异常/新增邮箱：`{extra_emails}`")
 
-            # 校验指定文字（如企业微信号）
-            full_text = "\n".join(current["lines"])
-            for req_text in target.get("required_texts", []):
-                if req_text not in full_text:
-                    site_issues.append(f"关键信息 `{req_text}` **已消失或被篡改**！")
+            # 2. 校验指定文字（如企业微信号）
+            for missing in current["missing_texts"]:
+                site_issues.append(f"关键信息 `{missing}` **已消失或被篡改**！")
 
-            # ---------- 2. 历史状态对比 ----------
+            # 3. 历史状态对比
             if url not in saved_state:
-                saved_state[url] = current
+                saved_state[url] = {
+                    "text_hash": current["text_hash"],
+                    "lines": current["lines"],
+                    "emails": current["emails"],
+                    "qr_hashes": current["qr_hashes"]
+                }
                 state_updated = True
-                qr_info = f"识别到 {len(current['qr_hashes'])} 张二维码图片" if target.get("check_qr") else "未开启"
+                if target.get("check_qr"):
+                    qr_count = len(current["qr_hashes"])
+                    qr_info = f"识别到 {qr_count} 张二维码/内嵌图片"
+                else:
+                    qr_info = "未开启"
                 init_reports.append(
                     f"- **{name}** ({url})\n"
                     f"  - 检测到邮箱：`{current['emails'] or '无'}`\n"
@@ -239,7 +315,6 @@ def main():
             else:
                 prev = saved_state[url]
 
-                # 对比二维码图片是否变动
                 if target.get("check_qr"):
                     prev_qr = prev.get("qr_hashes", {})
                     curr_qr = current["qr_hashes"]
@@ -250,7 +325,6 @@ def main():
                         saved_state[url]["qr_hashes"] = curr_qr
                         state_updated = True
 
-                # 对比正文和价格变动
                 if current["text_hash"] != prev.get("text_hash"):
                     diff_preview = get_text_diff(prev.get("lines", []), current["lines"])
                     change_alerts.append(
@@ -274,7 +348,6 @@ def main():
     if state_updated:
         save_state(saved_state)
 
-    # ---------- 3. 分级推送钉钉通知（标题均包含“监控”关键词） ----------
     if init_reports:
         send_dingtalk(
             "网页监控初始化成功",
